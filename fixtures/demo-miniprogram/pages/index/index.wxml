@@ -1,0 +1,4 @@
+<view class="container">
+  <text class="title">{{message}}</text>
+  <button bindtap="onTap" type="primary">点我 {{tapCount}} 次</button>
+</view>

@@ -1,0 +1,249 @@
+// 自动化会话：通过官方 miniprogram-automator 操控运行中的小程序。
+// 会话模型：同一时间只保留一条自动化连接（automation_start 换项目时会先断开旧的）。
+// 所有操作都带超时包装——IDE 卡死时快速报错，而不是让 agent 无限等待。
+import path from "node:path";
+
+import automator from "miniprogram-automator";
+
+import { runCli } from "./cli.js";
+import { fileExists, resolveProjectPath } from "./config.js";
+
+const DEFAULT_OP_TIMEOUT_MS = 30_000;
+const LAUNCH_TIMEOUT_MS = 180_000;
+const CONNECT_TIMEOUT_MS = 60_000;
+const CONSOLE_BUFFER_MAX = 200;
+
+function automationPort() {
+  const raw = process.env.WECHAT_DEVTOOLS_AUTOMATION_PORT?.trim();
+  const port = Number(raw);
+  return Number.isInteger(port) && port > 0 ? port : 9421;
+}
+
+function withTimeout(promise, timeoutMs, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`${label} 超时（${timeoutMs / 1000} 秒）`)),
+        timeoutMs
+      )
+    ),
+  ]);
+}
+
+let session = null; // { miniProgram, projectPath, consoleBuffer, exceptionBuffer }
+
+/** 未启动会话时给出明确指引，而不是把 undefined 当对象用时抛一堆内部堆栈 */
+function requireSession() {
+  if (!session) {
+    throw new Error(
+      "尚未建立自动化会话。请先调用 automation_start 打开目标项目。"
+    );
+  }
+  return session;
+}
+
+function recordConsole(msg) {
+  if (!session) return;
+  const args = (msg.args ?? []).map((arg) => {
+    if (typeof arg === "string") return arg;
+    try {
+      return JSON.stringify(arg);
+    } catch {
+      return String(arg);
+    }
+  });
+  session.consoleBuffer.push({
+    type: msg.type ?? "log",
+    text: args.join(" "),
+  });
+  if (session.consoleBuffer.length > CONSOLE_BUFFER_MAX) {
+    session.consoleBuffer.shift();
+  }
+}
+
+function recordException(error) {
+  if (!session) return;
+  session.exceptionBuffer.push({
+    message: error?.message ?? String(error),
+  });
+  if (session.exceptionBuffer.length > CONSOLE_BUFFER_MAX) {
+    session.exceptionBuffer.shift();
+  }
+}
+
+/**
+ * 连接自动化端口。cli auto 返回后 WS 服务可能还在初始化，
+ * 所以按固定节奏探测连接，超时仍失败则抛最后一次的真实报错。
+ */
+async function connectWithRetry(wsEndpoint) {
+  const deadline = Date.now() + CONNECT_TIMEOUT_MS;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      return await automator.connect({ wsEndpoint });
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  }
+  throw new Error(
+    `连接自动化端口失败（${wsEndpoint}）：${lastError?.message ?? lastError}`
+  );
+}
+
+/**
+ * 启动自动化会话：先经 runCli 执行 cli auto（开启自动化端口），
+ * 再用 automator.connect 建立 WebSocket 连接。
+ * 不用 SDK 自带的 automator.launch——它在高版本 Node 上裸 spawn cli.bat 会
+ * EINVAL（Node ≥18.20 的安全限制），报错被它吞成"cliPath 不正确"。
+ * 换项目时旧会话会被尽力断开；IDE 本体保持运行（disconnect 而非 close）。
+ */
+export async function startSession(rawProjectPath) {
+  const projectPath = resolveProjectPath(rawProjectPath);
+
+  if (session) {
+    await stopSession().catch(() => {}); // 旧连接清理失败不阻塞新会话
+  }
+
+  const port = automationPort();
+  const { code, stdout, stderr } = await runCli(
+    ["auto", "--project", projectPath, "--auto-port", String(port)],
+    { timeoutMs: LAUNCH_TIMEOUT_MS }
+  );
+  if (code !== 0) {
+    throw new Error(
+      `开启自动化端口失败：${stderr || stdout || `cli auto 退出码 ${code}`}`
+    );
+  }
+
+  const miniProgram = await connectWithRetry(`ws://127.0.0.1:${port}`);
+
+  session = {
+    miniProgram,
+    projectPath,
+    consoleBuffer: [],
+    exceptionBuffer: [],
+  };
+  miniProgram.on("console", recordConsole);
+  miniProgram.on("exception", recordException);
+
+  return `自动化会话已建立：${projectPath}\n自动化端口：${port}`;
+}
+
+/** 断开自动化连接（IDE 保持运行） */
+export async function stopSession() {
+  if (!session) return "当前没有自动化会话。";
+  const { miniProgram } = session;
+  session = null;
+  await withTimeout(miniProgram.disconnect(), DEFAULT_OP_TIMEOUT_MS, "断开自动化连接");
+  return "自动化会话已断开（开发者工具保持运行）。";
+}
+
+/** 重新加载指定页面（reLaunch 会重置页面栈，任何页面都能直达） */
+export async function reLaunch(url) {
+  const { miniProgram } = requireSession();
+  if (!url.startsWith("/")) {
+    throw new Error(`页面路径应以 / 开头，收到：${url}`);
+  }
+  const page = await withTimeout(
+    miniProgram.reLaunch(url),
+    DEFAULT_OP_TIMEOUT_MS,
+    `reLaunch ${url}`
+  );
+  return `已跳转到 ${page.path}`;
+}
+
+/**
+ * 当前页面信息（路径、页面栈、完整 data）。
+ * 注意：走 evaluate 在 appservice 直读，不依赖 IDE 的 Page.* 命令路由——
+ * 实测 IDE 2.01.2510290 + automator 0.12.1 组合下 Page.getData 会挂死。
+ */
+export async function getPageInfo() {
+  const { miniProgram } = requireSession();
+  const result = await withTimeout(
+    miniProgram.evaluate(() => {
+      const pages = getCurrentPages();
+      const current = pages[pages.length - 1];
+      return {
+        path: current ? current.route : null,
+        stackSize: pages.length,
+        data: current ? current.data : null,
+      };
+    }),
+    DEFAULT_OP_TIMEOUT_MS,
+    "读取页面信息"
+  );
+  return JSON.stringify(result, null, 2);
+}
+
+/**
+ * 调用当前页面的方法（等价于用户触发 bindtap 等事件后执行的处理函数）。
+ * 方法内若使用 this.setData，页面状态会正常更新。
+ */
+export async function callMethod(methodName, args = []) {
+  const { miniProgram } = requireSession();
+  const result = await withTimeout(
+    miniProgram.evaluate(
+      (name, methodArgs) => {
+        const pages = getCurrentPages();
+        const current = pages[pages.length - 1];
+        if (!current || typeof current[name] !== "function") {
+          throw new Error(`当前页面没有方法 ${name}`);
+        }
+        return current[name](...methodArgs);
+      },
+      methodName,
+      args
+    ),
+    DEFAULT_OP_TIMEOUT_MS,
+    `调用页面方法 ${methodName}`
+  );
+  return `已调用页面方法 ${methodName}，返回：${JSON.stringify(result) ?? "undefined"}\n页面状态可用 get_page_info 确认。`;
+}
+
+/** 调用 wx.* API（如 getSystemInfoSync、getStorageInfoSync） */
+export async function callWxMethod(methodName, args = []) {
+  const { miniProgram } = requireSession();
+  const result = await withTimeout(
+    miniProgram.callWxMethod(methodName, ...args),
+    DEFAULT_OP_TIMEOUT_MS,
+    `调用 wx.${methodName}`
+  );
+  return JSON.stringify(result, null, 2) ?? "undefined";
+}
+
+/** 截图保存到项目目录内（默认 automation-screenshot.png），返回保存路径 */
+export async function screenshot(rawOutputPath) {
+  const s = requireSession();
+  const outputPath = path.resolve(
+    rawOutputPath || path.join(s.projectPath, "automation-screenshot.png")
+  );
+  const rel = path.relative(s.projectPath, outputPath);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`截图保存路径必须位于项目目录内：${rawOutputPath}`);
+  }
+  await withTimeout(
+    s.miniProgram.screenshot({ path: outputPath }),
+    DEFAULT_OP_TIMEOUT_MS,
+    "截图"
+  );
+  if (!fileExists(outputPath)) {
+    throw new Error(`截图命令已执行但未生成文件：${outputPath}`);
+  }
+  return `截图已保存：${outputPath}`;
+}
+
+/** 返回缓存的控制台输出与异常；clear=true 时读完即清空 */
+export async function getConsoleLogs(clear = false) {
+  const s = requireSession();
+  const payload = {
+    console: s.consoleBuffer.slice(-100),
+    exceptions: s.exceptionBuffer.slice(-100),
+  };
+  if (clear) {
+    s.consoleBuffer = [];
+    s.exceptionBuffer = [];
+  }
+  return JSON.stringify(payload, null, 2);
+}

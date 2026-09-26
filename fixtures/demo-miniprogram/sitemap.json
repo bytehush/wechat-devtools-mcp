@@ -1,0 +1,9 @@
+{
+  "desc": "测试项目，不需要被微信索引",
+  "rules": [
+    {
+      "action": "disallow",
+      "page": "*"
+    }
+  ]
+}

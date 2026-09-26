@@ -1,0 +1,14 @@
+{
+  "description": "用于验证 wechat-devtools-mcp 的最小小程序项目",
+  "appid": "touristappid",
+  "compileType": "miniprogram",
+  "projectname": "demo-miniprogram",
+  "libVersion": "latest",
+  "setting": {
+    "es6": true,
+    "postcss": true,
+    "minified": true,
+    "minifyWXML": true
+  },
+  "condition": {}
+}

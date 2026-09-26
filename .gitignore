@@ -1,0 +1,6 @@
+node_modules/
+*.log
+fixtures/demo-miniprogram/preview-qr.png
+.DS_Store
+.mimosa/
+tmp-*.png

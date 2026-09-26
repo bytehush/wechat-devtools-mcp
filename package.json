@@ -1,0 +1,22 @@
+{
+  "name": "wechat-devtools-mcp",
+  "version": "0.2.0",
+  "description": "让 AI agent 通过 MCP 协议操控微信开发者工具：打开项目、查登录、预览二维码、上传代码、自动化操控运行中的小程序",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "wechat-devtools-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/config.js && node --check src/cli.js && node --check src/index.js && node --check src/automation.js",
+    "smoke": "node test/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "miniprogram-automator": "^0.12.1"
+  }
+}
