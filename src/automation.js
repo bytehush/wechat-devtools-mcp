@@ -5,7 +5,7 @@ import path from "node:path";
 
 import automator from "miniprogram-automator";
 
-import { runCli } from "./cli.js";
+import { runCliWithOptionalFlags } from "./cli.js";
 import { fileExists, resolveProjectPath } from "./config.js";
 
 const DEFAULT_OP_TIMEOUT_MS = 30_000;
@@ -13,10 +13,17 @@ const LAUNCH_TIMEOUT_MS = 180_000;
 const CONNECT_TIMEOUT_MS = 60_000;
 const CONSOLE_BUFFER_MAX = 200;
 
-function automationPort() {
+function automationPort(projectPath) {
   const raw = process.env.WECHAT_DEVTOOLS_AUTOMATION_PORT?.trim();
-  const port = Number(raw);
-  return Number.isInteger(port) && port > 0 ? port : 9421;
+  const fixed = Number(raw);
+  if (Number.isInteger(fixed) && fixed > 0) return fixed;
+  // 端口按项目路径哈希确定：不同项目的 IDE 窗口各自监听各自的端口，
+  // 避免 A 项目的自动化会话串到 B 项目窗口（实测踩坑：固定端口被
+  // 旧会话占用时 cli auto 仍报成功，连接却落到旧项目）。
+  // 范围 20000-39999，避开 Windows 动态端口段（49152 起）。
+  let hash = 5381;
+  for (const ch of projectPath) hash = ((hash << 5) + hash + ch.charCodeAt(0)) >>> 0;
+  return 20000 + (hash % 20000);
 }
 
 function withTimeout(promise, timeoutMs, label) {
@@ -106,9 +113,12 @@ export async function startSession(rawProjectPath) {
     await stopSession().catch(() => {}); // 旧连接清理失败不阻塞新会话
   }
 
-  const port = automationPort();
-  const { code, stdout, stderr } = await runCli(
+  const port = automationPort(projectPath);
+  // --enable-service-port：启动参数级开启服务端口（见 index.js open_project 注释）；
+  // --trust-project：免去项目的信任确认弹窗；旧版 CLI 不认识时自动去掉重试。
+  const { code, stdout, stderr } = await runCliWithOptionalFlags(
     ["auto", "--project", projectPath, "--auto-port", String(port)],
+    ["--enable-service-port", "--trust-project"],
     { timeoutMs: LAUNCH_TIMEOUT_MS }
   );
   if (code !== 0) {
@@ -128,7 +138,30 @@ export async function startSession(rawProjectPath) {
   miniProgram.on("console", recordConsole);
   miniProgram.on("exception", recordException);
 
-  return `自动化会话已建立：${projectPath}\n自动化端口：${port}`;
+  // 就绪探测：自动化代理可能早于 app 启动完成附着，页面栈为空时
+  // get_page_info 会拿到 null。轮询等首个页面出现（不吞错：超时也照常
+  // 建立会话，但在返回里如实提示，后续操作会暴露真实状态）。
+  let readyRoute = null;
+  const readyDeadline = Date.now() + 20_000;
+  while (Date.now() < readyDeadline) {
+    const stack = await withTimeout(
+      miniProgram.evaluate(() => getCurrentPages().map((p) => p.route)),
+      DEFAULT_OP_TIMEOUT_MS,
+      "就绪探测"
+    ).catch(() => null);
+    if (stack && stack.length > 0) {
+      readyRoute = stack[stack.length - 1];
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  return (
+    `自动化会话已建立：${projectPath}\n自动化端口：${port}` +
+    (readyRoute
+      ? `\n应用就绪，当前页面：${readyRoute}`
+      : `\n注意：应用页面栈 20 秒内未就绪（可能在编译中或存在编译错误），可用 get_page_info 复查。`)
+  );
 }
 
 /** 断开自动化连接（IDE 保持运行） */
@@ -140,18 +173,37 @@ export async function stopSession() {
   return "自动化会话已断开（开发者工具保持运行）。";
 }
 
-/** 重新加载指定页面（reLaunch 会重置页面栈，任何页面都能直达） */
+/** 重新加载指定页面：走 appservice 的 wx.reLaunch（任何页面类型都能直达）。
+ * 不用 automator 的 App.reLaunch 命令——实测该路由在当前 IDE+SDK 组合下
+ * 返回被吞掉的 "Uncaught [object Object]"，而 wx API 通道可靠。 */
 export async function reLaunch(url) {
   const { miniProgram } = requireSession();
   if (!url.startsWith("/")) {
     throw new Error(`页面路径应以 / 开头，收到：${url}`);
   }
-  const page = await withTimeout(
-    miniProgram.reLaunch(url),
+  const result = await withTimeout(
+    miniProgram.evaluate(
+      (target) =>
+        new Promise((resolve) => {
+          wx.reLaunch({ url: target, complete: resolve });
+        }),
+      url
+    ),
     DEFAULT_OP_TIMEOUT_MS,
     `reLaunch ${url}`
   );
-  return `已跳转到 ${page.path}`;
+  if (!result || result.errMsg !== "reLaunch:ok") {
+    throw new Error(`reLaunch 失败：${JSON.stringify(result) ?? "无返回"}`);
+  }
+  const route = await withTimeout(
+    miniProgram.evaluate(() => {
+      const pages = getCurrentPages();
+      return pages.length ? pages[pages.length - 1].route : null;
+    }),
+    DEFAULT_OP_TIMEOUT_MS,
+    "读取跳转后页面"
+  );
+  return `已跳转到 ${route}`;
 }
 
 /**

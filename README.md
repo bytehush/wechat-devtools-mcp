@@ -5,9 +5,10 @@
 调用页面方法、截图、读控制台日志）——用自然语言驱动小程序开发。
 
 ```
-AI agent ──stdio(MCP 协议)──> 本 MCP server ──命令行──> 微信开发者工具 cli.js ──> IDE
+AI agent ──stdio(MCP 协议)──> 本 MCP server ──命令行──> 微信开发者工具 CLI ──> IDE
                              └─自动化──────> miniprogram-automator（WebSocket）──┘
-                                                      └─ 基础操作经自带 node.exe 执行 cli.js
+        命令行双布局自适应：旧版经自带 node.exe 执行 cli.js；
+        新版（≥2.02，无 node.exe）经 Electron-as-node 运行官方 CLI 入口
 ```
 
 ## 前提条件
@@ -73,12 +74,19 @@ npm install
 `call_method` 触发交互 → `get_page_info` 验证变化 → `console_logs` 看有没有报错 →
 `screenshot` 留档。
 
-> **已知限制**：元素级 DOM 操作（按选择器查元素/点击/输入）依赖 automator 的
-> `Page.getElements` 等命令，实测在 IDE 2.01.2510290 + automator npm 0.12.1 组合下
-> 会挂死或报 "page node not found"（官方 npm SDK 已三年未更新，与新版 IDE 存在协议代差）。
-> 因此用 `call_method` + `get_page_info` 承担交互与状态读取，可靠性实测有保障。
-> 另：未提供"在 AppService 执行任意 JS"的工具——那是教科书级的代码注入面，
-> 结构化的 `call_method` / `wx_method` 已覆盖绝大多数调试需求。
+> **已知限制**：
+> - 元素级 DOM 操作（按选择器查元素/点击/输入）依赖 automator 的 `Page.getElements`
+>   等命令，实测在 IDE 2.01/2.02 + automator npm 0.12.1 组合下会挂死或报错（官方 npm
+>   SDK 已三年未更新，与新版 IDE 存在协议代差）。因此页面读取与交互走
+>   `get_page_info` / `call_method`（appservice 通道），实测可靠。
+> - 另：未提供"在 AppService 执行任意 JS"的工具——那是教科书级的代码注入面，
+>   结构化的 `call_method` / `wx_method` 已覆盖绝大多数调试需求。
+>
+> **自动化端口按项目路径哈希分配**（同一项目恒定，不同项目互不冲突），
+> 可用 `WECHAT_DEVTOOLS_AUTOMATION_PORT` 强制指定。`open_project` 与
+> `automation_start` 会带 `--enable-service-port` 启动参数（服务端口开关改配置
+> 文件无效——渲染进程 localStorage 会覆盖——这是官方正确姿势；旧版 CLI 不认识
+> 该参数时自动去掉重试）。
 
 接入后就可以这样对话：
 

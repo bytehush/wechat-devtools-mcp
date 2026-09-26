@@ -1,6 +1,7 @@
 node_modules/
 *.log
 fixtures/demo-miniprogram/preview-qr.png
+fixtures/demo-miniprogram/automation-screenshot.png
 .DS_Store
 .mimosa/
 tmp-*.png

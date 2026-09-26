@@ -22,10 +22,10 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import * as automation from "./automation.js";
-import { friendlyError, runCli } from "./cli.js";
+import { friendlyError, runCli, runCliWithOptionalFlags } from "./cli.js";
 import { fileExists, resolveProjectPath } from "./config.js";
 
-const SERVER_INFO = { name: "wechat-devtools-mcp", version: "0.2.0" };
+const SERVER_INFO = { name: "wechat-devtools-mcp", version: "0.2.1" };
 
 /** 校验 filePath 落在 dirPath 目录内，防止工具被用来写项目目录之外的文件 */
 function assertInsideDir(filePath, dirPath, label) {
@@ -53,11 +53,12 @@ const TOOLS = [
     },
     async run({ projectPath: rawPath }) {
       const projectPath = resolveProjectPath(rawPath);
-      const { code, stdout, stderr } = await runCli([
-        "open",
-        "--project",
-        projectPath,
-      ]);
+      // --enable-service-port：IDE 启动参数级开启服务端口（改配置文件会被
+      // 渲染进程 localStorage 覆盖，此参数是官方正确姿势，旧版 CLI 不认识时自动去掉重试）
+      const { code, stdout, stderr } = await runCliWithOptionalFlags(
+        ["open", "--project", projectPath],
+        ["--enable-service-port"]
+      );
       if (code !== 0) {
         throw new Error(stderr || stdout || `cli open 退出码 ${code}`);
       }

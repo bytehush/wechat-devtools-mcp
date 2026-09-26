@@ -1,10 +1,12 @@
-// 封装对微信开发者工具命令行（cli.js）的调用。
-// 所有命令都通过安装目录自带的 node.exe 执行，避开 .bat 的引号/安全限制。
+// 封装对微信开发者工具命令行（CLI）的调用。
+// 不直接执行 cli.bat：Windows 上 Node 裸 spawn .bat 会 EINVAL，
+// 且经 cmd.exe 转发后引号易错。改为按 config.js 探测出的布局
+// 直接调用底层运行时（旧版 node.exe / 新版 Electron-as-node），
+// 与官方 cli.bat 行为等价且参数不经 shell。
 import { execFile } from "node:child_process";
-import path from "node:path";
 import { promisify } from "node:util";
 
-import { getDevtoolsDir } from "./config.js";
+import { getCliInvocation } from "./config.js";
 
 const execFileP = promisify(execFile);
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -30,27 +32,31 @@ function decode(buf) {
  * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
  */
 export async function runCli(args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
-  const dir = getDevtoolsDir();
-  const nodeExe = path.join(dir, "node.exe");
-  const cliJs = path.join(dir, "cli.js");
+  const invocation = getCliInvocation();
   // 参数逐项作为 argv 传给目标程序，不经 shell 解释；
   // 来自 agent 的参数值只会是 CLI 的一个普通选项值。
-  const argv = [cliJs].concat(args);
+  const argv = invocation.baseArgs.concat(args);
 
-  // stdin 走 ignore（EOF）：CLI 弹出 y/N 交互提问（如首次开启服务端口）时
+  // stdin 走 ignore（EOF）：CLI 弹出 y/N 交互提问时
   // 会立即走默认分支退出并报错，而不是干等输入直到超时。
   const options = {
-    cwd: dir,
+    cwd: invocation.dir,
     shell: false,
     timeout: timeoutMs,
     killSignal: "SIGKILL",
     maxBuffer: 10 * 1024 * 1024,
     encoding: "buffer",
     stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      ...invocation.extraEnv,
+      // 官方 cli.bat 会把调用方 cwd 透传给 CLI（env.cwd），这里保持一致
+      cwd: process.cwd(),
+    },
   };
 
   try {
-    const { stdout, stderr } = await execFileP(nodeExe, argv, options);
+    const { stdout, stderr } = await execFileP(invocation.file, argv, options);
     return { code: 0, stdout: decode(stdout).trim(), stderr: decode(stderr).trim() };
   } catch (error) {
     if (error.killed || error.signal === "SIGKILL") {
@@ -66,6 +72,22 @@ export async function runCli(args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
       stderr: decode(error.stderr ?? "").trim(),
     };
   }
+}
+
+/**
+ * 带"新版才支持的参数"地调用 CLI：先用全量参数执行；
+ * 仅当失败输出点名了某个参数（旧版 CLI 不认识）时，去掉这些参数重试一次。
+ * 两次都失败时以最后一次的真实报错为准，不做任何吞错。
+ */
+export async function runCliWithOptionalFlags(args, flags, options) {
+  const first = await runCli(args.concat(flags), options);
+  if (first.code === 0) return first;
+
+  const output = `${first.stderr}\n${first.stdout}`;
+  const blamed = flags.some((flag) => output.includes(flag));
+  if (!blamed) return first; // 与参数无关的业务错误，原样返回
+
+  return runCli(args, options);
 }
 
 const HINTS = [
