@@ -1,6 +1,6 @@
 {
   "name": "wechat-devtools-mcp",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "让 AI agent 通过 MCP 协议操控微信开发者工具：打开项目、查登录、预览二维码、上传代码、自动化操控运行中的小程序",
   "type": "module",
   "main": "src/index.js",

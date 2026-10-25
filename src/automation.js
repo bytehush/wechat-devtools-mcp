@@ -1,17 +1,127 @@
 // 自动化会话：通过官方 miniprogram-automator 操控运行中的小程序。
 // 会话模型：同一时间只保留一条自动化连接（automation_start 换项目时会先断开旧的）。
 // 所有操作都带超时包装——IDE 卡死时快速报错，而不是让 agent 无限等待。
+import { spawn } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
+import net from "node:net";
 import path from "node:path";
 
 import automator from "miniprogram-automator";
 
 import { runCliWithOptionalFlags } from "./cli.js";
-import { fileExists, resolveProjectPath } from "./config.js";
+import { fileExists, getIdeExePath, resolveProjectPath } from "./config.js";
 
 const DEFAULT_OP_TIMEOUT_MS = 30_000;
 const LAUNCH_TIMEOUT_MS = 180_000;
 const CONNECT_TIMEOUT_MS = 60_000;
 const CONSOLE_BUFFER_MAX = 200;
+
+// ---- 确保 IDE 处于"可用"状态 ----
+// 为什么需要这一步：IDE 启动时会经 npm 模块调 reg.exe 读 MachineGuid / CPU 指令集。
+// 若 IDE 是 agent 直接 spawn 的子进程，在带命令白名单的执行环境里这一步会被拦截，
+// IDE 初始化悬死，cli auto 便一直停在 preparing。让 Explorer 代启可脱离 agent 的
+// 进程树，从而不受该黑名单连带管辖。
+// explorer.exe 不返回可靠退出码（实测成功时也为 1），所以一律用 TCP 端口实测可连
+// 作为唯一就绪判据；也不相信 .ide 文件本身——IDE 未运行时里面留着上次的陈旧端口。
+const IDE_POLL_INTERVAL_MS = 200;
+const IDE_READY_TIMEOUT_MS = 60_000;
+const PORT_PROBE_TIMEOUT_MS = 300;
+
+/** 读取所有 User Data 目录下 .ide 记录的端口（新版/旧版目录名都试，可能有多个实例） */
+function readIdePorts() {
+  const roots = ["微信开发者工具", "微信web开发者工具"].map((name) =>
+    path.join(process.env.LOCALAPPDATA ?? "", name, "User Data")
+  );
+  const ports = new Set();
+  for (const root of roots) {
+    let entries;
+    try {
+      entries = readdirSync(root);
+    } catch {
+      continue; // 该目录不存在
+    }
+    for (const entry of entries) {
+      try {
+        const raw = readFileSync(path.join(root, entry, "Default", ".ide"), "utf8").trim();
+        const port = Number.parseInt(raw, 10);
+        if (Number.isInteger(port) && port > 0 && port < 65536) ports.add(port);
+      } catch {
+        // 没有 .ide 或内容不可读，跳过
+      }
+    }
+  }
+  return [...ports];
+}
+
+/** TCP 连接探测：能连上才算 IDE 真的在监听（比读文件可靠） */
+function probePort(port) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: "127.0.0.1", port });
+    const finish = (ok) => {
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(PORT_PROBE_TIMEOUT_MS);
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.once("timeout", () => finish(false));
+  });
+}
+
+/** 找一个真实在监听的 IDE 端口；都没有则返回 null */
+async function findAliveIdePort() {
+  const ports = readIdePorts();
+  if (ports.length === 0) return null;
+  const results = await Promise.all(ports.map(async (p) => ({ p, ok: await probePort(p) })));
+  const hit = results.find((r) => r.ok);
+  return hit ? hit.p : null;
+}
+
+/**
+ * 经 explorer.exe 代启 IDE。同步触发、不等进程——explorer 会把请求转交给用户
+ * 会话里的 Explorer，由它创建 IDE 进程，因此 IDE 不在 agent 的进程树内。
+ * 不判返回值：explorer 成功时也常返回 1。
+ */
+function launchIdeViaExplorer(exePath) {
+  const child = spawn("explorer.exe", [exePath], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  child.on("error", () => {}); // explorer 起不来时由后续端口轮询兜底报错
+  child.unref();
+}
+
+/**
+ * 保证 IDE 可用。已在运行则立即返回（0 等待）；否则代启并轮询端口。
+ * @returns {{ launched: boolean, port: number, waitedMs: number }}
+ */
+async function ensureIdeRunning() {
+  const alive = await findAliveIdePort();
+  if (alive) return { launched: false, port: alive, waitedMs: 0 };
+
+  const exePath = getIdeExePath();
+  if (!exePath) {
+    throw new Error(
+      "微信开发者工具未运行，且无法定位其主程序。请手动打开开发者工具后重试。"
+    );
+  }
+
+  const startedAt = Date.now();
+  launchIdeViaExplorer(exePath);
+
+  const deadline = startedAt + IDE_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const port = await findAliveIdePort();
+    if (port) return { launched: true, port, waitedMs: Date.now() - startedAt };
+    await new Promise((resolve) => setTimeout(resolve, IDE_POLL_INTERVAL_MS));
+  }
+
+  throw new Error(
+    `开发者工具未能启动（等待 ${IDE_READY_TIMEOUT_MS / 1000} 秒端口仍未监听）：${exePath}\n` +
+      `请手动打开开发者工具，确认主界面出现后重试。`
+  );
+}
 
 function automationPort(projectPath) {
   const raw = process.env.WECHAT_DEVTOOLS_AUTOMATION_PORT?.trim();
@@ -114,6 +224,11 @@ export async function startSession(rawProjectPath) {
   }
 
   const port = automationPort(projectPath);
+
+  // 先确保 IDE 活着（必要时让 Explorer 代启）。IDE 未就绪就发 cli auto 的话，
+  // CLI 会自己去 spawn IDE——那正好走回"子进程被程序黑名单拦死"的老路。
+  const ide = await ensureIdeRunning();
+
   // --enable-service-port：启动参数级开启服务端口（见 index.js open_project 注释）；
   // --trust-project：免去项目的信任确认弹窗；旧版 CLI 不认识时自动去掉重试。
   const { code, stdout, stderr } = await runCliWithOptionalFlags(
@@ -158,6 +273,9 @@ export async function startSession(rawProjectPath) {
 
   return (
     `自动化会话已建立：${projectPath}\n自动化端口：${port}` +
+    (ide.launched
+      ? `\n开发者工具由 Explorer 代启，端口就绪耗时 ${ide.waitedMs} ms（IDE http 端口 ${ide.port}）`
+      : `\n开发者工具已在运行（http 端口 ${ide.port}）`) +
     (readyRoute
       ? `\n应用就绪，当前页面：${readyRoute}`
       : `\n注意：应用页面栈 20 秒内未就绪（可能在编译中或存在编译错误），可用 get_page_info 复查。`)

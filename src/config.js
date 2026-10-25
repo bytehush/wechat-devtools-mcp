@@ -159,6 +159,19 @@ export function getCliInvocation() {
 }
 
 /**
+ * 返回 IDE 主程序 exe 的绝对路径（用于让 Explorer 代启 IDE）。
+ * electron 布局下 CLI 的宿主程序就是 IDE 主程序；旧版布局下另找 >50MB 的 exe。
+ * 找不到时返回 null——调用方据此给出"请手动打开开发者工具"的指引。
+ */
+export function getIdeExePath() {
+  const dir = getDevtoolsDir();
+  const layout = probeLayout(dir);
+  if (layout.kind === "electron") return layout.file;
+  const exe = findElectronExe(dir);
+  return exe ? path.join(dir, exe) : null;
+}
+
+/**
  * 允许本 MCP 操作的项目根目录白名单。
  * 环境变量 WECHAT_DEVTOOLS_MCP_ALLOWED_ROOTS：多个目录用分号分隔。
  * 未配置时默认只放行自带的测试项目——工具不该能碰任意目录。

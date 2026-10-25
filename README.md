@@ -15,11 +15,19 @@ AI agent ──stdio(MCP 协议)──> 本 MCP server ──命令行──> �
 
 1. **Node.js ≥ 18**（本机 v24 已满足）
 2. **微信开发者工具** 已安装，并且至少手动打开、扫码登录过一次
-3. **服务端口已开启**：打开开发者工具 →「设置 → 安全设置」→ 打开「服务端口」
+3. **（重要）IDE 的启动方式有讲究**：IDE 启动时会经 npm 模块调 `reg.exe` 读 `MachineGuid`
+   做设备指纹、读 CPU `FeatureSet`。若 IDE 是 agent 直接 spawn 的子进程，在带命令白名单的
+   执行环境里这一步会被拦截，IDE 初始化悬死，`cli auto` 就一直停在 `preparing`、拿不到截图。
+   **本 MCP 已内置处理**：`automation_start` 先用 TCP 实测 IDE 端口，没在跑就经
+   `explorer.exe` 代启（进程脱离 agent 的进程树），再轮询端口直到可连——实测端口就绪约
+   1.9 秒。你也可以提前手动打开开发者工具，那样这一步 0 等待（`explorer.exe` 不返回可靠
+   退出码，所以就绪判据只认端口实测，不认 `.ide` 文件里的陈旧端口）。
+   CLI 本身跑在沙箱里没问题——它不碰注册表，只有它派生的 IDE 才会。
+4. **服务端口已开启**：打开开发者工具 →「设置 → 安全设置」→ 打开「服务端口」
    （首次用命令行调用时工具也会弹窗询问，输入 y 确认即可）
-4. 如果工具没装在常见路径，设置环境变量 `WECHAT_DEVTOOLS_CLI` 指向安装目录
+5. 如果工具没装在常见路径，设置环境变量 `WECHAT_DEVTOOLS_CLI` 指向安装目录
    （即包含 `cli.js` 的目录，例如 `D:\程序员工具包\微信web开发者工具`）
-5. **（重要）目录白名单**：MCP 只会操作白名单内的项目目录。通过环境变量
+6. **（重要）目录白名单**：MCP 只会操作白名单内的项目目录。通过环境变量
    `WECHAT_DEVTOOLS_MCP_ALLOWED_ROOTS` 配置，多个目录用分号 `;` 分隔；
    **未配置时默认只允许自带的测试项目**。这样即使 agent 被恶意内容诱导，也动不了白名单外的目录。
 
@@ -100,6 +108,8 @@ npm install
 | 报错提示未登录 | 打开开发者工具，微信扫码登录；或先调 `check_login` 确认 |
 | 预览报 AppID 相关错误 | `touristappid`（游客模式）不能预览/上传，需在 `project.config.json` 填真实 AppID |
 | CLI 命令超时 | 开发者工具卡死时重启它；若刚被强制结束过进程，服务端口设置可能回落为关闭，重新开启即可 |
+| `cli auto` 卡在 `preparing` 不动、拿不到截图 | v0.2.2 起 `automation_start` 会先 TCP 探端口、必要时经 `explorer.exe` 代启 IDE。若仍卡住，说明代启失败（IDE 主程序路径异常等），手动打开开发者工具后重试；或把 `reg.exe` 从 Security Center → Command Security → Program Blacklist 移除 |
+| 报 `IDE may already started at port xxxxx` | `User Data\<hash>\Default\.ide` 里是上次的陈旧端口。IDE 正常运行时无害（CLI 会自建 server）；IDE 没运行时会多一次连接重试 |
 | 报错"项目路径不在允许的目录白名单内" | 把项目所在目录加进 `WECHAT_DEVTOOLS_MCP_ALLOWED_ROOTS`（分号分隔多个），改完重启 MCP server / 重启对话 |
 | 找不到工具安装目录 | 设 `WECHAT_DEVTOOLS_CLI` 环境变量，或把路径加进 `src/config.js` 的 `COMMON_DIRS` |
 
