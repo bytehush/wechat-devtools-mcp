@@ -4,4 +4,5 @@ fixtures/demo-miniprogram/preview-qr.png
 fixtures/demo-miniprogram/automation-screenshot.png
 .DS_Store
 .mimosa/
+.workbuddy/
 tmp-*.png
